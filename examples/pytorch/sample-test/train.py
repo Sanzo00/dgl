@@ -4,16 +4,29 @@ from turtle import color
 import dgl
 import torch
 import numpy as np
-from ogb.nodeproppred import DglNodePropPredDataset
+# from ogb.nodeproppred import DglNodePropPredDataset
 from dgl.data import CoraGraphDataset, CiteseerGraphDataset, PubmedGraphDataset
 from dgl.data import RedditDataset
 import argparse
 import sklearn.metrics
+import os
 
 # sampler = dgl.dataloading.NeighborSampler([4, 4])
 def get_train_val_dataloader(args, graph, train_nids, valid_nids, device):
   sampler = dgl.dataloading.NeighborSampler(args.sample)
-  train_dataloader = dgl.dataloading.DataLoader(
+  train_dataloader_full = dgl.dataloading.DataLoader(
+      # The following arguments are specific to DGL's DataLoader.
+      graph,              # The graph
+      train_nids,         # The node IDs to iterate over in minibatches
+      sampler,            # The neighbor sampler
+      device=device,      # Put the sampled MFGs on CPU or GPU
+      # The following arguments are inherited from PyTorch DataLoader.
+      batch_size=args.full_batch,    # Batch size
+      shuffle=True,       # Whether to shuffle the nodes for every epoch
+      drop_last=False,    # Whether to drop the last incomplete batch
+      num_workers=0       # Number of sampler processes
+  )
+  train_dataloader_mini = dgl.dataloading.DataLoader(
       # The following arguments are specific to DGL's DataLoader.
       graph,              # The graph
       train_nids,         # The node IDs to iterate over in minibatches
@@ -29,13 +42,13 @@ def get_train_val_dataloader(args, graph, train_nids, valid_nids, device):
       graph, 
       valid_nids, 
       sampler,
-      batch_size=args.batch_size,
+      batch_size=args.full_batch,
       shuffle=False,
       drop_last=False,
       num_workers=0,
       device=device
   )
-  return train_dataloader, val_dataloader
+  return train_dataloader_full, train_dataloader_mini, val_dataloader
 
 # input_nodes, output_nodes, mfgs = example_minibatch = next(iter(train_dataloader))
 # print(example_minibatch)
@@ -110,10 +123,10 @@ class GCN(nn.Module):
 # model = Model(num_features, 128, num_classes).to(device)
 def main(args):
   # load data
-  if args.gpu >= 0:
-    device = 'cuda'
-  else:
+  if args.gpu < 0:
     device = 'cpu'
+  else:
+    device = 'cuda'
   if args.dataset == 'cora':
     dataset = CoraGraphDataset()
   elif args.dataset == 'citeseer':
@@ -123,11 +136,17 @@ def main(args):
   elif args.dataset == 'reddit':
     dataset = RedditDataset()
   graph = dataset[0]
+  if args.gpu >= 0:
+    graph.int().to(args.gpu)
+
+  print('type graph', graph, type(graph))
+  print('graph device', graph.device)  
   # Add reverse edges since ogbn-arxiv is unidirectional.
   # graph = dgl.add_reverse_edges(graph)
   # graph.ndata['label'] = node_labels[:, 0]
 
   node_features = graph.ndata['feat']
+  print(node_features, type(node_features))
   num_features = node_features.shape[1]
   num_classes = (graph.ndata['label'].max() + 1).item()
   print(graph)
@@ -140,17 +159,21 @@ def main(args):
   print('train_nids.shape:', train_nids.shape)
   print('valid_nids.shape:', valid_nids.shape)
   print('test_nids.shape:', test_nids.shape)
-  if args.batch_size == -1:
-    args.batch_size = len(train_nids)
-  print('batch_size:', args.batch_size)
+  args.full_batch = len(train_nids)
+  # if args.batch_size == -1:
+  #   args.batch_size = len(train_nids)
+  # print('batch_size:', args.batch_size)
 
   model = GCN(num_features, args.n_hidden, num_classes, args.n_layers, F.relu, args.dropout)
+  if device == 'cuda':
+    model.cuda()
+  print('model device', next(model.parameters()).device)
   # model = GCN(num_features, args.n_hidden, num_classes, args.n_layers, F.relu, args.dropout).to(device)
   # opt = torch.optim.Adam(model.parameters())
   opt = torch.optim.Adam(model.parameters(),
                                  lr=args.lr,
                                  weight_decay=args.weight_decay)
-  train_dataloader, val_dataloader = get_train_val_dataloader(args, graph, train_nids, valid_nids, device)
+  train_dataloader_full, train_dataloader_mini, val_dataloader = get_train_val_dataloader(args, graph, train_nids, valid_nids, device)
 
   # best_accuracy = 0
   # best_model_path = 'model.pt'
@@ -160,8 +183,12 @@ def main(args):
     model.train()
     train_predictions = []
     train_labels = []
+    if args.mode == 'full':
+      train_dataloader = train_dataloader_full
+    elif args.mode == 'mini':
+      train_dataloader = train_dataloader_mini
+
     for step, (input_nodes, output_nodes, mfgs) in enumerate(train_dataloader):
-      print('epoch {} batch {}'.format(epoch, step))
     # for (input_nodes, output_nodes, mfgs) in train_dataloader:
         # feature copy from CPU to GPU takes place here
       inputs = mfgs[0].srcdata['feat'] # 1644, 1433
@@ -197,6 +224,9 @@ def main(args):
       labels = np.concatenate(labels)
       accuracy = sklearn.metrics.accuracy_score(labels, predictions)
       val_acc_list.append(accuracy)
+      print('dataset: {} mode: {} epoch: {} batch_num: {} train_acc: {:.2%} val_acc: {:.2%}'
+            .format(args.dataset, args.mode, epoch, step, train_accuracy, accuracy))
+
       # print('Epoch {} Train Accuracy {:.3f} Validation Accuracy {}'.format(epoch, train_accuracy, accuracy))
 
   # print(val_acc_list)
@@ -257,22 +287,32 @@ if __name__ == '__main__':
   parser.set_defaults(self_loop=False)
   args = parser.parse_args()
   args.sample = [int(item) for item in args.sample.split(',')]
+  # args.gpu = 0
+  # args.batch_size = 64
   print(args)
 
   # full batch vs mini batch
   save_dir = './full-mini-train-test-acc/'
+  if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
   # for dataset in ['cora', 'citeseer', 'pubmed']:
+  #   args.batch_size = 32
   for dataset in ['reddit']:
     args.dataset = dataset
     # full batch
+    args.mode = 'full'
     args.sample = [-1, -1]
-    args.batch_size = -1
     full_train_acc, full_val_acc = main(args)
 
     # mini batch
-    args.sample = [4, 4]
-    args.batch_size = 64
+    args.mode = 'mini'
+    args.sample = [-1, -1]
+    # args.sample = [4, 4]
     mini_train_acc, mini_val_acc = main(args)
-
+    
     draw(full_train_acc, mini_train_acc, desc=['full train acc', 'mini train acc'], title=dataset, save=save_dir+dataset+'-train.png')
     draw(full_val_acc, mini_val_acc, desc=['full val acc', 'mini val acc'], title=dataset, save=save_dir+dataset+'-val.png')
+
+    # # auto
+    # args.mode = 'mini-full'
+    # args.sample = [4, 4]
